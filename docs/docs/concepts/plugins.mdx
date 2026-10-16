@@ -15,14 +15,16 @@ When an event fires during Mellea's execution (e.g., "about to call the LLM" or 
 2. **Runs plugins in priority order**, grouped by execution mode
 3. **Returns a result** — continue unchanged, continue with a modified payload, or block execution entirely
 
-Plugins are organized into six hook categories:
+Plugins are organized into eight hook categories:
 
 - **Session Lifecycle** — session init, reset, and cleanup (`session_pre_init`, `session_post_init`, `session_reset`, `session_cleanup`)
 - **[Component](../reference/glossary.md#component) Lifecycle** — before and after component execution (`component_pre_execute`, `component_post_success`, `component_post_error`)
-- **Generation Pipeline** — before and after LLM calls (`generation_pre_call`, `generation_post_call`, `generation_error`)
+- **Generation Pipeline** — before and after LLM calls, single or batched, plus mid-generation events (`generation_pre_call`, `generation_post_call`, `generation_error`, `generation_batch_pre_call`, `generation_batch_post_call`, `generation_batch_error`, `generation_event`)
 - **Validation** — before and after [requirement](../reference/glossary.md#requirement) checks (`validation_pre_check`, `validation_post_check`)
 - **Sampling Pipeline** — sampling loop events (`sampling_loop_start`, `sampling_iteration`, `sampling_repair`, `sampling_loop_end`)
 - **Tool Execution** — before and after tool invocations (`tool_pre_invoke`, `tool_post_invoke`)
+- **Adapter Function Lifecycle** — after an adapter function (LoRA/aLoRA intrinsic) call or one of its lifecycle phases completes (`adapter_function_invocation_complete`, `adapter_function_phase_complete`)
+- **Streaming Pipeline** — start, per-event, and end of a `stream()` run (`streaming_start`, `streaming_event`, `streaming_end`)
 
 :::note
 Plugins require the hooks extra: `pip install 'mellea[hooks]'`
@@ -416,7 +418,7 @@ async def enforce_model_policy(payload, ctx):
 
 **Fires:** After the session is fully initialized, before any operations.
 
-**Payload fields:** `session` (the `MelleaSession` instance)
+**Payload fields:** `session_id`, `model_id`, `context`
 
 **Writable fields:** *(observe-only)*
 
@@ -563,6 +565,57 @@ async def cap_tokens(payload, ctx):
 - Error telemetry and alerting on backend failures
 - Logging structured error information for debugging
 
+#### `generation_batch_pre_call`
+
+**Fires:** Once before a batch generation request, when `generate_from_raw()` sends several actions to the backend in a single API call.
+
+**Payload fields:** `actions`, `generation_id`, `model_options`, `format`, `tool_calls`, `num_actions`, `model`, `provider`
+
+**Writable fields:** `model_options`, `format`, `tool_calls`
+
+**Use cases:**
+
+- Batch-level token budget enforcement
+- Applying model option defaults to batch requests
+
+#### `generation_batch_post_call`
+
+**Fires:** Once after a batch generation request succeeds. `generation_id` matches the corresponding `generation_batch_pre_call` payload.
+
+**Payload fields:** `generation_id`, `model_outputs`, `usage`, `model`, `provider`, `latency_ms`
+
+**Writable fields:** *(observe-only)*
+
+**Use cases:**
+
+- Batch latency and aggregate token-usage metrics
+- Logging batch outputs
+
+#### `generation_batch_error`
+
+**Fires:** Once when a batch generation request raises, just before the exception is re-raised. No `ModelOutputThunk` instances are present.
+
+**Payload fields:** `generation_id`, `exception`, `model`, `provider`, `latency_ms`
+
+**Writable fields:** *(observe-only)*
+
+**Use cases:**
+
+- Error telemetry for batch requests
+
+#### `generation_event`
+
+**Fires:** On milestone events during a single generation. The only event today is `chunk_processed`, emitted once per streamed chunk when `MELLEA_GENERATION_CHUNK_EVENTS=true`; subscribers branch on `event_name` and read the keys `data` carries for that event.
+
+**Payload fields:** `generation_id`, `event_name`, `model`, `provider`, `data`
+
+**Writable fields:** *(observe-only)*
+
+**Use cases:**
+
+- Per-chunk streaming metrics (time per output chunk)
+- Recording span events for streamed generations
+
 ---
 
 ### Validation
@@ -584,7 +637,7 @@ async def cap_tokens(payload, ctx):
 
 **Fires:** After all validations complete.
 
-**Payload fields:** `requirements`, `results`, `all_validations_passed`, `passed_count`, `failed_count`, `generate_logs`
+**Payload fields:** `validation_id`, `requirements`, `results`, `all_validations_passed`, `passed_count`, `failed_count`, `exception`
 
 **Writable fields:** `results`, `all_validations_passed`
 
@@ -610,6 +663,10 @@ async def cap_tokens(payload, ctx):
 
 - Dynamically adjusting the iteration budget
 - Logging sampling configuration
+
+:::note
+The `sampling_*` hooks fire for sampling strategies run through `act()`/`aact()`. A `stream()` run never fires them, even when it validates against requirements; it fires the [streaming pipeline](#streaming-pipeline) hooks instead.
+:::
 
 #### `sampling_iteration`
 
@@ -694,6 +751,86 @@ The payload includes an `is_control_flow` field that is `True` for framework con
 
 ---
 
+### Adapter function lifecycle
+
+These hooks are fired by the adapter machinery behind [LoRA and aLoRA adapters](../advanced/lora-and-alora-adapters.md) and [intrinsics](../advanced/intrinsics.md). They drive the `mellea.adapter_function.*` [metrics](../observability/metrics.md).
+
+#### `adapter_function_invocation_complete`
+
+**Fires:** After an adapter function invocation finishes, on every outcome (`"success"`, `"schema_error"`, or `"error"`). The span of work it covers depends on `binding_type`: for `"local_file"` adapters it is the `adapter_scope()` activate→generate→deactivate cycle; for `"embedded"` adapters it is generate plus JSON parsing.
+
+**Payload fields:** `name`, `revision`, `binding_type`, `adapter_type`, `outcome`, `error`
+
+**Writable fields:** *(observe-only)*
+
+**Use cases:**
+
+- Adapter success-rate and schema-drift metrics
+- Structured logging of adapter failures
+
+#### `adapter_function_phase_complete`
+
+**Fires:** After one adapter lifecycle phase (`"prepare"`, `"activate"`, `"generate"`, `"parse"`, or `"deactivate"`) completes successfully. A phase that raises does not fire this hook; the failure surfaces at invocation level instead.
+
+**Payload fields:** `name`, `phase`, `duration_ms`
+
+**Writable fields:** *(observe-only)*
+
+**Use cases:**
+
+- Phase latency histograms
+
+:::warning
+A handler for this hook must not synchronously call `resolve_adapter()`, `register_embedded_adapter_model()`, or `add_adapter()` on the backend that fired it. Those methods hold a backend-level lock for their whole body and the `"prepare"` phase dispatches this hook from inside them on a dedicated thread, so a handler that re-enters one of them deadlocks.
+:::
+
+---
+
+### Streaming pipeline
+
+These hooks are fired by `stream()` from `mellea.stdlib`. They share a `streaming_id` so a plugin can correlate the start, the events, and the end of one run.
+
+#### `streaming_start`
+
+**Fires:** Before a `stream()` run starts generation.
+
+**Payload fields:** `streaming_id`, `has_requirements`, `requirement_count`, `chunking_strategy`
+
+**Writable fields:** *(observe-only)*
+
+**Use cases:**
+
+- Opening a span for the stream
+- Logging streaming configuration
+
+#### `streaming_event`
+
+**Fires:** Once per `StreamEvent` emitted during the run: `ChunkEvent`, `QuickCheckEvent`, `StreamingDoneEvent`, `FullValidationEvent`, `ErrorEvent`, and the final `CompletedEvent`. For a `QuickCheckEvent`, `requirements` carries the active requirement instances in the same order as the event's results.
+
+**Payload fields:** `streaming_id`, `event`, `requirements`
+
+**Writable fields:** *(observe-only)*
+
+**Use cases:**
+
+- Per-chunk validation metrics
+- Recording streaming progress as span events
+
+#### `streaming_end`
+
+**Fires:** When the run finishes, on every exit path: natural completion, validation-fail early exit, caller break, and unhandled exception. `success` and `exception` together distinguish the outcomes.
+
+**Payload fields:** `streaming_id`, `success`, `failure_reason`, `exception`, `model`, `provider`, `full_text_length`
+
+**Writable fields:** *(observe-only)*
+
+**Use cases:**
+
+- Closing the stream's span
+- Streaming success-rate and duration metrics
+
+---
+
 ### Hook payload policy table
 
 This table summarizes which fields are writable for each hook type. Changes to non-writable fields are silently discarded.
@@ -710,6 +847,10 @@ This table summarizes which fields are writable for each hook type. Changes to n
 | `generation_pre_call` | `model_options`, `format`, `tool_calls` |
 | `generation_post_call` | *(observe-only)* |
 | `generation_error` | *(observe-only)* |
+| `generation_batch_pre_call` | `model_options`, `format`, `tool_calls` |
+| `generation_batch_post_call` | *(observe-only)* |
+| `generation_batch_error` | *(observe-only)* |
+| `generation_event` | *(observe-only)* |
 | `validation_pre_check` | `requirements`, `model_options` |
 | `validation_post_check` | `results`, `all_validations_passed` |
 | `sampling_loop_start` | `loop_budget` |
@@ -718,6 +859,11 @@ This table summarizes which fields are writable for each hook type. Changes to n
 | `sampling_loop_end` | *(observe-only)* |
 | `tool_pre_invoke` | `model_tool_call` |
 | `tool_post_invoke` | `tool_output` |
+| `adapter_function_invocation_complete` | *(observe-only)* |
+| `adapter_function_phase_complete` | *(observe-only)* |
+| `streaming_start` | *(observe-only)* |
+| `streaming_event` | *(observe-only)* |
+| `streaming_end` | *(observe-only)* |
 
 :::warning
 Only `SEQUENTIAL` and `TRANSFORM` modes can modify payloads. `AUDIT`, `CONCURRENT`, and `FIRE_AND_FORGET` modes have their modifications silently discarded regardless of the policy table.
@@ -1041,7 +1187,7 @@ from mellea.plugins import (
 | `block(reason, *, code, details)` | Create a blocking `PluginResult` |
 | `modify(payload, **field_updates)` | Create a modifying `PluginResult` via `model_copy` |
 | `is_internal_tool(tool_name)` | Returns `True` if the tool is a framework control-flow tool (e.g. `final_answer`) |
-| `HookType` | Enum with all 18 hook types |
+| `HookType` | Enum with all 27 hook types |
 | `PluginMode` | Enum: `SEQUENTIAL`, `TRANSFORM`, `AUDIT`, `CONCURRENT`, `FIRE_AND_FORGET` |
 | `PluginResult` | Typed result with `continue_processing`, `modified_payload`, and `violation` |
 | `PluginViolationError` | Exception with `.reason`, `.code`, `.hook_type`, `.plugin_name` |
